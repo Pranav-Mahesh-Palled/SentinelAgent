@@ -1,0 +1,17 @@
+{
+  "scenario-syn-01": {
+    "expected_probe_ids": ["SYN-PROBE-001"],
+    "min_probes": 1,
+    "description": "Single probe ping/DNS validation scenario"
+  },
+  "scenario-syn-multi": {
+    "expected_probe_ids": ["SYN-PROBE-001", "SYN-PROBE-002"],
+    "min_probes": 2,
+    "description": "Multi-probe dual protocol validation scenario"
+  },
+  "scenario-syn-manual": {
+    "expected_probe_ids": ["SYN-PROBE-001"],
+    "min_probes": 1,
+    "description": "Manual operator packet capture validation scenario"
+  }
+}

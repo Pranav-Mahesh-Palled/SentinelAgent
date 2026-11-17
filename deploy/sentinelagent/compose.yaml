@@ -1,0 +1,356 @@
+# =============================================================================
+# SentinelAgent Production Docker Compose Deployment (Hardened Architecture)
+# Services:
+#   db          - PostgreSQL 18.6 (isolated, internal-only, named persistent volume)
+#   migration   - One-shot Alembic migration (sentinel_migration_role, internal-only)
+#   api         - FastAPI REST API (sentinel_app_role, non-root, dual-homed)
+#   worker      - Response Orchestration Worker (sentinel_app_role, non-root)
+#   frontend    - Nginx React SPA + API reverse proxy (non-root, port 8080)
+#
+# Networks:
+#   sentinel_db_network       - internal: true  (PostgreSQL, Migration, API, Worker)
+#                               Guarantees ZERO inbound or outbound internet access.
+#   sentinel_frontend_network - internal: true  (Frontend, API)
+#                               Transports reverse-proxy traffic between Nginx and FastAPI.
+#   sentinel_egress_network   - internal: false (API, Worker -> External AI providers)
+#                               Standard Docker bridge network providing Layer-3 NAT egress
+#                               for Google Gemini API communication.
+#                               NOTE: Standard Docker bridge networks do NOT enforce
+#                               Layer-4 port filtering (e.g. port 443 only). Strict
+#                               port filtering or IP pinning requires host firewall
+#                               rules (iptables/nftables) or an egress proxy.
+# =============================================================================
+
+name: sentinelagent
+
+networks:
+  sentinel_ingress_network:
+    name: sentinelagent_ingress_network
+    driver: bridge
+    internal: false
+
+  sentinel_ingress_frontend_network:
+    name: sentinelagent_ingress_frontend_network
+    driver: bridge
+    internal: true
+
+  sentinel_frontend_network:
+    name: sentinelagent_frontend_network
+    driver: bridge
+    internal: true
+
+  sentinel_db_network:
+    name: sentinelagent_db_network
+    driver: bridge
+    internal: true
+
+  sentinel_egress_network:
+    name: sentinelagent_egress_network
+    driver: bridge
+    internal: false
+
+volumes:
+  sentinel_pgdata:
+    name: ${SENTINEL_VOLUME_NAME:-sentinel_pgdata}
+
+# Bounded logging anchor to prevent host disk exhaustion
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# =============================================================================
+# Secrets: File-backed Compose Secrets
+# Note: Docker Compose mounts file secrets directly via read-only bind mounts,
+# ignoring container-level uid/gid/mode overrides on Linux hosts. Host secret
+# files must be set to mode 0644 (rw-r--r--) so that non-root container
+# processes (UID 10001 for api/worker/migration, UID 70 for postgres) can read
+# them. Host directory traversal is restricted via chmod 700 on the host.
+# =============================================================================
+secrets:
+  postgres_admin_password:
+    file: ${POSTGRES_ADMIN_PASSWORD_FILE:-./secrets/postgres_admin_password.txt}
+  migration_password:
+    file: ${MIGRATION_PASSWORD_FILE:-./secrets/migration_password.txt}
+  app_password:
+    file: ${APP_PASSWORD_FILE:-./secrets/app_password.txt}
+  migration_database_url:
+    file: ${MIGRATION_DATABASE_URL_FILE:-./secrets/migration_database_url.txt}
+  app_database_url:
+    file: ${APP_DATABASE_URL_FILE:-./secrets/app_database_url.txt}
+  operator_credentials:
+    file: ${OPERATOR_CREDENTIALS_FILE:-./secrets/operator_credentials.json}
+  gemini_api_key:
+    file: ${GEMINI_API_KEY_FILE:-./secrets/gemini_api_key.txt}
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Database Service (PostgreSQL 18.6 - Isolated Internal-Only Network)
+  # ---------------------------------------------------------------------------
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b}
+    container_name: sentinelagent-db
+    restart: unless-stopped
+    networks:
+      - sentinel_db_network
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sentinelagent}
+      POSTGRES_USER: ${POSTGRES_USER:-sentinel_admin}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      PGDATA: ${PGDATA:-/var/lib/postgresql/data}
+      MIGRATION_USER: ${MIGRATION_USER:-sentinel_migration_role}
+      MIGRATION_PASSWORD_FILE: /run/secrets/migration_password
+      APP_USER: ${APP_USER:-sentinel_app_role}
+      APP_PASSWORD_FILE: /run/secrets/app_password
+    volumes:
+      - sentinel_pgdata:/var/lib/postgresql
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    secrets:
+      - postgres_admin_password
+      - migration_password
+      - app_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-sentinel_admin} -d $${POSTGRES_DB:-sentinelagent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 128m
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+          pids: 100
+        reservations:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # 2. Database Migration Service (One-shot Alembic runner, Migration Role)
+  # ---------------------------------------------------------------------------
+  migration:
+    build:
+      context: ../..
+      dockerfile: deploy/sentinelagent/backend/Dockerfile
+    container_name: sentinelagent-migration
+    restart: "no"
+    command: ["migrate"]
+    networks:
+      - sentinel_db_network
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      ENVIRONMENT: production
+    secrets:
+      - migration_database_url
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+          pids: 50
+        reservations:
+          memory: 128M
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+  # ---------------------------------------------------------------------------
+  # 3. Production FastAPI Backend Service (Runtime Application Role)
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/sentinelagent/backend/Dockerfile
+    container_name: sentinelagent-api
+    restart: unless-stopped
+    command: ["api"]
+    networks:
+      - sentinel_db_network
+      - sentinel_frontend_network
+      - sentinel_egress_network
+    depends_on:
+      db:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${API_PORT:-8000}:8000"
+    environment:
+      APP_DATABASE_URL_FILE: /run/secrets/app_database_url
+      OPERATOR_CREDENTIALS_FILE: /run/secrets/operator_credentials
+      GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
+      ENVIRONMENT: production
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+      HINDSIGHT_ENABLED: "false"
+      HINDSIGHT_REQUIRED: "false"
+      HINDSIGHT_RECALL_ENABLED: "false"
+    secrets:
+      - app_database_url
+      - operator_credentials
+      - gemini_api_key
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/api/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+          pids: 100
+        reservations:
+          memory: 256M
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+  # ---------------------------------------------------------------------------
+  # 4. Response Orchestration Worker (Runtime Application Role)
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/sentinelagent/backend/Dockerfile
+    container_name: sentinelagent-worker
+    restart: unless-stopped
+    command: ["worker", "--poll-interval", "2.0", "--concurrency", "5", "--sweeper-interval", "10.0"]
+    networks:
+      - sentinel_db_network
+      - sentinel_egress_network
+    depends_on:
+      db:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    environment:
+      APP_DATABASE_URL_FILE: /run/secrets/app_database_url
+      OPERATOR_CREDENTIALS_FILE: /run/secrets/operator_credentials
+      GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
+      ENVIRONMENT: production
+      HINDSIGHT_ENABLED: "false"
+      HINDSIGHT_REQUIRED: "false"
+      HINDSIGHT_RECALL_ENABLED: "false"
+    secrets:
+      - app_database_url
+      - operator_credentials
+      - gemini_api_key
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+          pids: 100
+        reservations:
+          memory: 256M
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+  # ---------------------------------------------------------------------------
+  # 5. Production Frontend (Nginx SPA + Reverse Proxy)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/sentinelagent/frontend/Dockerfile
+    container_name: sentinelagent-frontend
+    restart: unless-stopped
+    networks:
+      - sentinel_ingress_frontend_network
+      - sentinel_frontend_network
+    depends_on:
+      api:
+        condition: service_healthy
+    ports: []
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+          pids: 50
+        reservations:
+          memory: 64M
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101
+      - /var/run:rw,noexec,nosuid,size=16m,uid=101,gid=101
+
+  # ---------------------------------------------------------------------------
+  # 6. Dedicated Ingress Proxy Service (Edge Gateway to Frontend)
+  # ---------------------------------------------------------------------------
+  ingress:
+    image: nginx:1.30-alpine@sha256:901e593c95dc85f5a729f5765516321366ef4ac401821431d408897e95287d0a
+    container_name: sentinelagent-ingress
+    restart: unless-stopped
+    user: "101:101"
+    networks:
+      - sentinel_ingress_network
+      - sentinel_ingress_frontend_network
+    depends_on:
+      frontend:
+        condition: service_healthy
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${FRONTEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./ingress/nginx.conf:/etc/nginx/nginx.conf:ro
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+          pids: 50
+        reservations:
+          memory: 64M
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=101,gid=101
+      - /var/run:rw,noexec,nosuid,size=16m,uid=101,gid=101

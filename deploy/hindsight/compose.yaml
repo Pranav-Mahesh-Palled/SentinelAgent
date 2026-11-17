@@ -1,0 +1,263 @@
+# ==============================================================================
+# SentinelAgent - Hindsight Auxiliary Incident-Memory Deployment Specification
+# ==============================================================================
+# Architecture Contract: Option B (Task 9G.7A / 9G.7B Ingress Partitioning)
+# Topology: 4-Network Partitioned Ingress with Dedicated Host Proxy & Zero-Egress Core
+# Services:
+#   1. sentinelagent-hindsight-gw: nginxinc/nginx-unprivileged@sha256:07783a7b...
+#   2. sentinelagent-hindsight:    ghcr.io/vectorize-io/hindsight@sha256:d2bc230a...
+#   3. sentinelagent-ollama-gw:    nginxinc/nginx-unprivileged@sha256:07783a7b...
+#   4. sentinelagent-ollama:       ollama/ollama@sha256:910d0d81...
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Dedicated Hindsight API Ingress Proxy (Host Ingress Gateway)
+  # ----------------------------------------------------------------------------
+  hindsight-gw:
+    image: nginxinc/nginx-unprivileged@sha256:07783a7bd042ac2229183c0660aca15fcdf9a006bb4e37c7efd78482bc3900b9
+    platform: linux/amd64
+    container_name: sentinelagent-hindsight-gw
+    restart: unless-stopped
+    read_only: true
+    user: "101:101"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    tmpfs:
+      - /tmp
+      - /var/run
+      - /var/cache/nginx
+
+    # Bind REST API exclusively to host loopback.
+    ports:
+      - "127.0.0.1:8888:8888"
+
+    volumes:
+      - ./gateway/api-nginx.conf:/etc/nginx/nginx.conf:ro
+
+    networks:
+      - sentinelagent-ingress-net
+      - sentinelagent-api-net
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -q -O - http://127.0.0.1:8888/healthz | grep -q healthy || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # 2. Hindsight Application Daemon
+  # ----------------------------------------------------------------------------
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight@sha256:d2bc230a714e933affd63753e181a0579328fdcbbc021800a76e0bc7b6e76b31
+    platform: linux/amd64
+    container_name: sentinelagent-hindsight
+    restart: unless-stopped
+    stop_grace_period: 75s
+
+    # Note: Ports are NOT published on the application container.
+    # Ingress is mediated exclusively via sentinelagent-hindsight-gw across sentinelagent-api-net.
+    networks:
+      - sentinelagent-api-net
+      - sentinelagent-hindsight-net
+
+    environment:
+      # --- Component Activation ---
+      # Enable Data Plane REST API; Disable Web Dashboard / Control Plane
+      HINDSIGHT_ENABLE_API: "true"
+      HINDSIGHT_ENABLE_CP: "false"
+
+      # --- Surface Hardening ---
+      # Explicitly disable Model Context Protocol (MCP) server endpoints (/mcp, /sse)
+      HINDSIGHT_API_MCP_ENABLED: "false"
+
+      # --- Server-Side Authentication ---
+      # Extension: Built-in static shared-secret equality comparison over HTTP Bearer auth
+      # Secret: Must be populated from deploy/hindsight/.env.hindsight
+      HINDSIGHT_API_TENANT_EXTENSION: "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension"
+      HINDSIGHT_API_TENANT_API_KEY: "${HINDSIGHT_API_KEY:?HINDSIGHT_API_KEY must be configured in .env.hindsight}"
+
+      # --- Offline Model Execution ---
+      # Blocks unapproved Hugging Face egress. Pre-deployment weight seeding is mandatory.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+      # --- Startup Coordination & Timeouts ---
+      # Application model loading timeout (Python level)
+      HINDSIGHT_API_MODEL_INIT_TIMEOUT: "300"
+      # Entrypoint wrapper health-check loop wait duration before container fails (start-all.sh)
+      HINDSIGHT_API_STARTUP_WAIT_SECONDS: "330"
+
+      # --- Stable Worker Identity & Shutdown Drain ---
+      # Static worker ID prevents orphaned task reservations across container recreation
+      HINDSIGHT_API_WORKER_ID: "sentinelagent-hindsight-dev-worker-1"
+      # Worker shutdown drain window (upstream default: 20s; leaves 40s before wrapper hard-kill)
+      HINDSIGHT_API_WORKER_SHUTDOWN_DRAIN_SECONDS: "20"
+
+      # --- Global LLM Configuration (Restricted Containerized Gateway) ---
+      HINDSIGHT_API_LLM_PROVIDER: "ollama"
+      HINDSIGHT_API_LLM_BASE_URL: "http://sentinelagent-ollama-gw:11434/v1"
+      HINDSIGHT_API_LLM_MODEL: "gemma3:4b"
+      HINDSIGHT_API_LLM_OLLAMA_NUM_CTX: "16384"
+
+      # --- Retain LLM Configuration (Restricted Containerized Gateway Override) ---
+      HINDSIGHT_API_RETAIN_LLM_PROVIDER: "ollama"
+      HINDSIGHT_API_RETAIN_LLM_BASE_URL: "http://sentinelagent-ollama-gw:11434/v1"
+      HINDSIGHT_API_RETAIN_LLM_MODEL: "gemma3:4b"
+      HINDSIGHT_API_RETAIN_CHUNK_SIZE: "1024"
+      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS: "8192"
+
+      # --- Decision Models Explicitly Disabled (Zero External Providers) ---
+      HINDSIGHT_API_DECISION_MODEL_PROVIDER: "none"
+      HINDSIGHT_API_RECALL_DECISION_MODEL_PROVIDER: "none"
+      HINDSIGHT_API_REFLECT_DECISION_MODEL_PROVIDER: "none"
+      HINDSIGHT_API_CONSOLIDATION_DECISION_MODEL_PROVIDER: "none"
+      HINDSIGHT_API_CONSOLIDATION_USE_DECISION_MODEL: "false"
+      HINDSIGHT_API_REFLECT_USE_DECISION_MODEL: "false"
+      HINDSIGHT_API_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL: "false"
+      HINDSIGHT_API_MENTAL_MODEL_DELTA_USE_DECISION_MODEL: "false"
+
+      # --- Local In-Container Embeddings (Plural Contract) ---
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: "local"
+      HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL: "BAAI/bge-small-en-v1.5"
+
+      # --- Local In-Container Reranker (Singular Contract) ---
+      HINDSIGHT_API_RERANKER_PROVIDER: "local"
+      HINDSIGHT_API_RERANKER_LOCAL_MODEL: "hindsight-ai/hs-rerank-1"
+
+    volumes:
+      # Persistent embedded PostgreSQL memory database (pg0)
+      - sentinelagent-hindsight-data:/home/hindsight/.pg0
+      # Persistent local model cache (Hugging Face embeddings and cross-encoder weights)
+      - sentinelagent-hindsight-models:/home/hindsight/.cache/huggingface
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -m
+        - hindsight_api.http_probe
+        - http://127.0.0.1:8888/health
+        - "3"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 360s
+
+  # ----------------------------------------------------------------------------
+  # 3. Restricted Ollama Reverse-Proxy Gateway
+  # ----------------------------------------------------------------------------
+  ollama-gw:
+    image: nginxinc/nginx-unprivileged@sha256:07783a7bd042ac2229183c0660aca15fcdf9a006bb4e37c7efd78482bc3900b9
+    platform: linux/amd64
+    container_name: sentinelagent-ollama-gw
+    restart: unless-stopped
+    read_only: true
+    user: "101:101"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    tmpfs:
+      - /tmp
+      - /var/run
+      - /var/cache/nginx
+
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+
+    networks:
+      - sentinelagent-hindsight-net
+      - sentinelagent-ollama-net
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -q -O - http://127.0.0.1:11434/healthz | grep -q healthy || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # 4. Containerized Ollama LLM Engine
+  # ----------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama@sha256:910d0d8107b538fb0894e63163eb195de0cc7aefcbc666dc62d3b18f71124592
+    platform: linux/amd64
+    container_name: sentinelagent-ollama
+    restart: unless-stopped
+
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_NOPRUNE: "true"
+
+    volumes:
+      # Writable mount required for Ollama v0.40.16 fixBlobs() startup routines
+      - sentinelagent-ollama-models:/root/.ollama
+
+    networks:
+      - sentinelagent-ollama-net
+
+    healthcheck:
+      test:
+        - CMD
+        - /bin/ollama
+        - list
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+# ==============================================================================
+# Persistent Volumes
+# ==============================================================================
+volumes:
+  sentinelagent-hindsight-data:
+    name: sentinelagent-hindsight-data
+    external: true
+  sentinelagent-hindsight-models:
+    name: sentinelagent-hindsight-models
+    external: true
+  sentinelagent-ollama-models:
+    name: sentinelagent-ollama-models
+    external: true
+
+# ==============================================================================
+# Network Architecture: Option B 4-Network Partitioned Ingress Topology
+# ==============================================================================
+networks:
+  # Network 1: Ingress Bridge (Allows Docker port mapping for host loopback 127.0.0.1:8888)
+  sentinelagent-ingress-net:
+    name: sentinelagent-ingress-net
+    driver: bridge
+    internal: false
+
+  # Network 2: Internal API Bridge (Connects Ingress Gateway to Hindsight Application)
+  sentinelagent-api-net:
+    name: sentinelagent-api-net
+    driver: bridge
+    internal: true
+
+  # Network 3: Internal Inference Bridge (Connects Hindsight Application to Ollama Gateway)
+  sentinelagent-hindsight-net:
+    name: sentinelagent-hindsight-net
+    driver: bridge
+    internal: true
+
+  # Network 4: Internal LLM Bridge (Connects Ollama Gateway to Ollama Engine)
+  sentinelagent-ollama-net:
+    name: sentinelagent-ollama-net
+    driver: bridge
+    internal: true

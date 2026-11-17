@@ -1,0 +1,26 @@
+# ==============================================================================
+# SentinelAgent - Optional GPU Reservation Override for Containerized Ollama
+# ==============================================================================
+# Architecture Contract: Option B (Task 9F.7)
+# Target Service: sentinelagent-ollama
+# Hardware Target: NVIDIA GPU (e.g. GeForce RTX 3050 Laptop via WSL2 DirectX)
+#
+# Usage:
+#   docker compose -f compose.yaml -f compose.gpu.yaml --env-file .env.hindsight up -d
+#
+# Prerequisite:
+#   Ensure the official Docker NVIDIA CUDA sample passes before activating:
+#   docker run --rm --platform=linux/amd64 --gpus=all nvcr.io/nvidia/k8s/cuda-sample:nbody@sha256:59261e419d6d48a772aad5bb213f9f1588fcdb042b115ceb7166c89a51f03363 nbody -gpu -benchmark
+#   (Platform Linux AMD64 manifest: sha256:7278897bef4fc36f4d21cf3c591be597911a2d7ee45c7d1e55bde9d89b96c75a)
+# ==============================================================================
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+

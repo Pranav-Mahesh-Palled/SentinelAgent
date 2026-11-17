@@ -64,6 +64,21 @@ flowchart TD
     end
 ```
 
+### Deployed Services (6 Services)
+* **`ingress`:** Dedicated edge reverse proxy (unprivileged Nginx) handling external HTTP/HTTPS traffic.
+* **`frontend`:** React 19 Single Page Application (SPA) web server and internal `/api/*` reverse proxy.
+* **`api`:** FastAPI ASGI application server hosting REST endpoints, business logic, and health probes.
+* **`worker`:** Asynchronous Python response worker processing the outbox queue and running active verification probes.
+* **`migration`:** One-shot initialization container executing Alembic migrations to head `34ea070e907d` and locking down database privileges before the API and worker start.
+* **`db`:** PostgreSQL 18.6 relational database with role-level privilege isolation and persistent volume storage.
+
+### Network Segmentation (5 Isolated Networks)
+1. **`sentinel_ingress_network`:** External bridge network exposing only the ingress proxy to `${BIND_IP:-127.0.0.1}:${FRONTEND_PORT:-8080}`.
+2. **`sentinel_ingress_frontend_network` (`internal: true`):** Private network connecting the edge ingress proxy to the frontend container.
+3. **`sentinel_frontend_network` (`internal: true`):** Private network connecting the frontend Nginx reverse proxy to the backend API.
+4. **`sentinel_db_network` (`internal: true`):** Isolated database tier allowing connections only from `migration`, `api`, and `worker`. Zero host ports are published.
+5. **`sentinel_egress_network`:** Controlled egress bridge allowing outbound HTTPS access to external AI services (strictly limited to `api` and `worker`; `frontend` and `db` have no egress attachment).
+
 ---
 
 ## 4. Investigation Workflow
@@ -153,34 +168,47 @@ SentinelAgent/
 ├── .env.example                       # Root environment configuration template
 ├── alembic.ini                        # Database migration configuration
 ├── pytest.ini                         # Pytest configuration
+├── LICENSE                            # Apache License 2.0
+├── README.md                          # Technical architecture and operational guide
 ├── backend/
+│   ├── alembic/                       # Alembic migration management
+│   │   ├── env.py                     # Migration runner and model metadata
+│   │   └── versions/                  # 6 linear migration revisions (Head: 34ea070e907d)
 │   ├── app/
 │   │   ├── api/                       # REST API route handlers (events, health, response)
 │   │   ├── core/                      # Configuration, settings, security contracts
-│   │   ├── db/                        # Database sessions, models, role alignment logic
-│   │   ├── models/                    # SQLAlchemy ORM models (17 schema tables)
+│   │   ├── db/                        # Database sessions, connection pooling, role alignment
+│   │   ├── models/                    # SQLAlchemy ORM models (17 application tables)
 │   │   ├── schemas/                   # Pydantic request/response schemas
 │   │   ├── services/                  # Business logic, claim worker, verification engine
-│   │   └── worker/                    # Background polling and sweeper runtime
-│   ├── migrations/                    # Alembic migration revisions (Head: 34ea070e907d)
-│   └── tests/                         # 197 automated test suites (unit, security, deployment)
+│   │   ├── workers/                   # Background polling and sweeper runtime
+│   │   └── main.py                    # FastAPI application entry point
+│   ├── tests/                         # 1,331 automated backend tests across 50 test modules
+│   └── requirements.txt               # Backend Python dependencies
 ├── frontend/
-│   ├── src/                           # React UI components and state management
-│   ├── tests/                         # Node/TS frontend security and logic tests
+│   ├── src/                           # React UI components, hooks, and context
+│   ├── tests/                         # Frontend tests (node --test)
 │   ├── package.json                   # Frontend dependencies
 │   └── vite.config.ts                 # Vite bundle configuration
 ├── deploy/
 │   ├── sentinelagent/
 │   │   ├── compose.yaml               # 5-network, 6-service production Compose specification
 │   │   ├── .env.example               # Deployment environment template
-│   │   ├── backend/                   # Backend Dockerfile (multi-stage Python 3.13)
-│   │   ├── frontend/                  # Frontend Dockerfile (Vite build + Nginx runtime)
-│   │   ├── ingress/                   # Dedicated edge ingress proxy configuration
-│   │   ├── init-db/                   # Database role initialization and cluster scripts
+│   │   ├── backend/                   # Backend Dockerfile & entrypoint.sh (Python 3.13)
+│   │   ├── frontend/                  # Frontend Dockerfile & nginx.conf (React + Nginx)
+│   │   ├── ingress/                   # Dedicated edge ingress proxy configuration (nginx.conf)
+│   │   ├── init-db/                   # Database role initialization (01-init-roles.sh/.sql)
 │   │   ├── scripts/                   # Secret generation and role provisioning scripts
-│   │   └── README.md                  # Comprehensive deployment documentation
+│   │   └── README.md                  # Comprehensive deployment runbook
 │   └── hindsight/                     # Companion episodic memory deployment definitions
-└── docs/                              # Architecture freeze and runbook documentation
+│       ├── compose.yaml               # Hindsight service Compose specification
+│       ├── compose.gpu.yaml           # GPU-accelerated Hindsight specification
+│       ├── .env.hindsight.example     # Hindsight environment template
+│       └── gateway/                   # Hindsight gateway Nginx proxy configuration
+└── docs/                              # Architecture freeze, runbook, and readiness docs
+    ├── ARCHITECTURE_FREEZE.md
+    ├── DEMONSTRATION_RUNBOOK.md
+    └── RELEASE_READINESS.md
 ```
 
 ---
@@ -256,8 +284,19 @@ docker compose up -d
 ## 13. Testing Instructions
 
 ### Backend Automated Test Suite
+The repository includes **1,331 automated tests** across 50 test modules validating unit logic, MITRE ATT&CK correlation, memory serialization, response state machines, and API contracts.
+
+A dedicated **197-test regression suite** specifically exercises Phase 12 deployment integration, container hardening, database role least-privilege, and configuration boundaries.
+
 ```bash
-# Run the complete test suite (197 tests)
+# Run the deployment, security, and configuration regression suite (197 tests)
+pytest backend/tests/test_deployment_security.py \
+       backend/tests/test_deployment_integration.py \
+       backend/tests/test_database_deployment.py \
+       backend/tests/test_align_roles.py \
+       backend/tests/test_config.py -v
+
+# Run the complete backend test suite (1,331 tests across 50 test modules)
 pytest backend/tests -v
 ```
 
@@ -277,16 +316,19 @@ docker compose config --quiet
 
 ## 14. Security Architecture and Hardening
 
+* **Schema Architecture & Migration Tracking:**
+  * The database schema comprises **17 application tables** across 4 discrete security tiers (8 immutable forensic tables, 2 transactional queue tables, 6 core operational tables, and 1 migration tracking table).
+  * The database schema is established through **6 linear Alembic migration revisions** terminating at head revision `34ea070e907d`.
 * **Database Least Privilege:**
-  * `sentinel_migration_role`: Owns the `public` schema; possesses full DDL and migration privileges.
-  * `sentinel_app_role`: Runtime application role used by API and worker. **Zero `DELETE` privileges, zero `TRUNCATE` privileges, zero `REFERENCES` privileges, and zero sequences** across all 17 tables.
+  * `sentinel_migration_role`: Owns the `public` schema; possesses full DDL and migration privileges used exclusively during one-shot startup migrations.
+  * `sentinel_app_role`: Runtime application role used by API and worker. **Zero `DELETE` privileges, zero `TRUNCATE` privileges, zero `REFERENCES` privileges, and zero sequence permissions** across all 17 tables.
 * **Network Isolation (5 Discrete Networks):**
-  * `sentinel_ingress_network`: External gateway for ingress proxy published port.
+  * `sentinel_ingress_network`: External gateway for ingress proxy published port (`${BIND_IP:-127.0.0.1}:${FRONTEND_PORT:-8080}`).
   * `sentinel_ingress_frontend_network` (`internal: true`): Ingress-to-Frontend communication.
   * `sentinel_frontend_network` (`internal: true`): Frontend-to-API communication.
   * `sentinel_db_network` (`internal: true`): Database communication (Database container publishes zero host ports).
   * `sentinel_egress_network`: Controlled outbound access for external APIs (API and worker only; frontend has no egress access).
-* **Container Security Context:**
+* **Container Security Context (6 Hardened Services):**
   * All containers enforce `security_opt: [no-new-privileges:true]`.
   * `api`, `worker`, `migration`, `frontend`, and `ingress` drop all Linux capabilities (`cap_drop: [ALL]`). *(PostgreSQL retains standard capabilities required for rootless UID 70 user switching).*
   * Read-only root filesystems (`read_only: true`) on all web and application containers with explicit, in-memory `tmpfs` mounts (`noexec,nosuid`).

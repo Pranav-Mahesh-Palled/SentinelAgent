@@ -37,8 +37,8 @@ Automating these workflows carries serious risk: hallucinations or unverified au
 * **Automated Telemetry Ingestion & Triage:** Ingests authentication logs, SSH audit records, and security events with schema-level validation and deduplication.
 * **MITRE ATT&CK Matrix Correlation:** Automatically identifies and maps adversary tactics, techniques, and procedures (TTPs) against enterprise attack patterns.
 * **Historical Investigation Recall (Hindsight Memory):** Provides contextual case retrieval to compare current incidents with historically resolved incidents and outbox patterns.
-* **Two-Person Integrity (Human Approval Gate):** Enforces a strict separation between the operator proposing a response action and the authorized operator approving it. Self-approval is rejected at both the API and database levels.
-* **Simulation-Only Response Orchestration:** Generates and executes response actions strictly in a mock, isolated sandbox environment (e.g. simulated IP blocklists and simulated host isolations). **SentinelAgent does not execute live firewall blocks or modify real network infrastructure.**
+* **Two-Person Integrity (Human Approval Gate):** Enforces a strict separation between the operator proposing a response action and the authorized operator approving it. Self-approval is rejected at the application API layer, while the database enforces lifecycle state machine integrity and immutable audit logging.
+* **Simulation-Only Response Orchestration:** Generates and executes response actions strictly within a persistent PostgreSQL simulation ledger (`simulated_blocklist_entries`). **SentinelAgent executes actions via a simulation adapter with zero modifications to live firewalls, host routing tables, or operating system infrastructure.**
 * **Mathematical Verification & Reconciliation:** Following simulated action execution, a verification engine runs active probes to evaluate whether the simulation outcome matches intended policy rules.
 * **Append-Only Forensic Audit Logging:** All state changes, approval decisions, execution logs, and probe results are recorded in immutable, append-only database tables with zero `DELETE` privileges.
 * **Defense-in-Depth Container Architecture:** Multi-network container topology with non-root execution, dropped Linux capabilities, read-only root filesystems, and least-privilege PostgreSQL roles.
@@ -88,7 +88,7 @@ flowchart TD
 2. **`sentinel_ingress_frontend_network` (`internal: true`):** Private network connecting the edge ingress proxy to the frontend container.
 3. **`sentinel_frontend_network` (`internal: true`):** Private network connecting the frontend Nginx reverse proxy to the backend API.
 4. **`sentinel_db_network` (`internal: true`):** Isolated database tier allowing connections only from `migration`, `api`, and `worker`. Zero host ports are published.
-5. **`sentinel_egress_network`:** Controlled egress bridge allowing outbound HTTPS access to external AI services (strictly limited to `api` and `worker`; `frontend` and `db` have no egress attachment).
+5. **`sentinel_egress_network`:** Docker egress bridge providing outbound internet connectivity for the `api` and `worker` services (e.g., reaching external AI services such as Google Gemini). The `frontend`, `db`, and `migration` services have no egress network attachment.
 
 ---
 
@@ -133,7 +133,7 @@ SentinelAgent implements strict safety guardrails for all response interventions
 [Action Proposed]  ──► (Action Payload Hash Generated)
         │
         ▼
-[Two-Person Review] ──► Rejects self-approval by proposer (HTTP 403 / DB Rule)
+[Two-Person Review] ──► Rejects self-approval by proposer (HTTP 403 Application Gate)
         │              ──► Rejects expired proposals
         ▼
 [Action Approved]  ──► Action queued to response_outbox
@@ -338,7 +338,7 @@ docker compose config --quiet
   * `sentinel_ingress_frontend_network` (`internal: true`): Ingress-to-Frontend communication.
   * `sentinel_frontend_network` (`internal: true`): Frontend-to-API communication.
   * `sentinel_db_network` (`internal: true`): Database communication (Database container publishes zero host ports).
-  * `sentinel_egress_network`: Controlled outbound access for external APIs (API and worker only; frontend has no egress access).
+  * `sentinel_egress_network`: Outbound Docker bridge network providing internet access for API and worker services (e.g., external AI API calls); frontend, db, and migration services have no egress attachment.
 * **Container Security Context (6 Hardened Services):**
   * All containers enforce `security_opt: [no-new-privileges:true]`.
   * `api`, `worker`, `migration`, `frontend`, and `ingress` drop all Linux capabilities (`cap_drop: [ALL]`). *(PostgreSQL retains standard capabilities required for rootless UID 70 user switching).*

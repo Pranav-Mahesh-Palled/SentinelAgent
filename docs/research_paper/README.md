@@ -21,7 +21,7 @@ The paper details six primary engineering and research contributions:
 
 1. **Dual Threat Detection Engine:**
    - Heuristic sliding-window (1-minute window) rule detector for rapid brute-force pattern recognition.
-   - Unsupervised `IsolationForest` anomaly detector (100 estimators, contamination calibrated via `default_target_fpr = 0.05`) operating on 5-dimensional feature vectors (`failed_count`, `distinct_users`, `distinct_ips`, `mean_duration_ms`, `off_hours_ratio`) from streaming SSH authentication telemetry.
+   - Unsupervised `IsolationForest` anomaly detector (100 estimators, contamination calibrated via `default_target_fpr = 0.05`) operating on 6-dimensional behavioral feature vectors (`total_attempts`, `failed_login_count`, `successful_login_count`, `distinct_usernames`, `failure_ratio`, `success_after_failures`) extracted across 1-minute fixed UTC time windows from streaming SSH authentication telemetry.
 
 2. **Grounded AI Investigation Agent:**
    - Constrained two-phase LLM agent (powered by Google Gemini) operating within a strict 5-round investigation ceiling.
@@ -29,18 +29,18 @@ The paper details six primary engineering and research contributions:
    - In-memory provenance registry (`AuthorizedProvenanceSet`) tracking queried database primary keys to validate citations and enforce defense-in-depth against prompt injection and hallucinated evidence.
 
 3. **Two-Person Integrity (Human-in-the-Loop Gate):**
-   - Cryptographic and relational role separation requiring distinct operator identities to propose and approve containment actions (`proposer_id != approver_id`). Self-approval is rejected at both the API and database levels.
+   - Role-based separation of duties requiring distinct operator identities to propose and approve containment actions (`proposer_id != approver_id`). Self-approval is validated and rejected at the application service and API dependency layers (`validate_proposer_approver_separation`), while the PostgreSQL database enforces lifecycle state transitions, SHA-256 payload digest binding, deadline constraints, and trigger-enforced audit logging.
 
 4. **Simulation-Only Response Orchestration:**
-   - Safe containment execution confined strictly to a persistent PostgreSQL ledger (`simulated_blocklist_entries`, `simulated_host_isolations`).
-   - Absolute isolation guarantee: zero live firewall, routing table, or operating system state modifications.
+   - Safe containment execution confined strictly to a persistent PostgreSQL relational simulation ledger (`simulated_blocklist_entries`).
+   - Simulation-only response adapter: Containment actions execute via a dedicated simulation adapter (`simulation.block_source_ip`) that commits simulated block records to the relational database without modifying live firewalls, host network stacks, or operating system routing tables.
 
 5. **Post-Simulation Mathematical Verification & Immutability:**
    - Active probe engine (`VerificationService`) querying network simulation state to mathematically verify policy enforcement.
    - Append-only PostgreSQL triggers (`fn_prevent_immutable_modification()`) enforcing tamper resistance across audit logs, approval records, and probe results.
 
 6. **Defense-in-Depth Container Deployment:**
-   - Multi-tier production deployment packaged across six unprivileged services (Ingress Proxy, Frontend, Backend API, Response Worker, Migration Runner, PostgreSQL Database) across five isolated Docker networks (3 internal, 2 external bridge).
+   - Multi-tier production deployment packaged across six unprivileged services (Ingress Proxy, Frontend, Backend API, Response Worker, Migration Runner, PostgreSQL Database) across five isolated Docker networks (three internal bridge networks, one ingress bridge, and an outbound Docker egress bridge providing internet connectivity for the API and worker services to reach external APIs such as Google Gemini; frontend, database, and migration services have no egress bridge attachment).
 
 ---
 
@@ -78,12 +78,10 @@ The paper incorporates three high-resolution architectural and process figures, 
 If referencing this work or platform architecture:
 
 ```bibtex
-@inproceedings{palled2026sentinelagent,
-  author    = {Pranav Mahesh Palled and Pranay Pandurang Patil and Omkar Gurav and Mayur Narayan Dharwadkar},
-  title     = {Design and Implementation of {SentinelAgent}: An {AI}-Assisted Framework for Cybersecurity Incident Investigation and Human-Approved Response Simulation},
-  booktitle = {Proceedings of AVALANCHE 2026},
-  address   = {Belagavi, Karnataka, India},
-  organization = {Department of Computer Science and Engineering, KLS Gogte Institute of Technology},
-  year      = {2026}
+@unpublished{palled2026sentinelagent,
+  author = {Pranav Mahesh Palled and Pranay Pandurang Patil and Omkar Gurav and Mayur Narayan Dharwadkar},
+  title  = {Design and Implementation of {SentinelAgent}: An {AI}-Assisted Framework for Cybersecurity Incident Investigation and Human-Approved Response Simulation},
+  note   = {Student research manuscript prepared for AVALANCHE 2026, Department of Computer Science and Engineering, KLS Gogte Institute of Technology, Belagavi, Karnataka, India},
+  year   = {2026}
 }
 ```

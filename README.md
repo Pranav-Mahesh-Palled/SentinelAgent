@@ -13,6 +13,17 @@ SentinelAgent is a modern, modular cybersecurity platform designed to automate s
 
 ---
 
+## Research Paper — AVALANCHE 2026
+
+**Title:** *Design and Implementation of SentinelAgent: An AI-Assisted Framework for Cybersecurity Incident Investigation and Human-Approved Response Simulation*
+
+A student research paper presenting the architectural design, threat detection pipeline, AI-assisted investigation agent with provenance tracking, Two-Person Integrity response authorization, and PostgreSQL simulation ledger of SentinelAgent has been prepared for **AVALANCHE 2026** at KLS Gogte Institute of Technology.
+
+* **Full Paper (PDF):** [`docs/research_paper/SentinelAgent_AVALANCHE_2026_Paper.pdf`](docs/research_paper/SentinelAgent_AVALANCHE_2026_Paper.pdf)
+* **Research Paper Deliverables & Source:** [`docs/research_paper/`](docs/research_paper/)
+
+---
+
 ## 1. Problem Statement
 
 Modern Security Operations Centers (SOCs) face overwhelming alert fatigue, fragmented contextual data, and slow triage cycles. When alerts trigger, analysts must manually correlate telemetry, map observed behaviors to threat frameworks, query historical case databases, and decide on mitigation steps.
